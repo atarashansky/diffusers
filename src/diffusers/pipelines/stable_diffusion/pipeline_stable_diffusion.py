@@ -2,7 +2,10 @@ import inspect
 from typing import List, Optional, Union
 
 import torch
-
+import numpy as np
+from PIL import Image
+from torchvision.utils import make_grid
+from einops import rearrange
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
@@ -33,10 +36,14 @@ class StableDiffusionPipeline(DiffusionPipeline):
         num_inference_steps: Optional[int] = 50,
         guidance_scale: Optional[float] = 7.5,
         eta: Optional[float] = 0.0,
-        generator: Optional[torch.Generator] = None,
+        seed_x = 42,
+        seed_y = 42,
+        n_iter=1,
         torch_device: Optional[Union[str, torch.device]] = None,
-        output_type: Optional[str] = "pil",
     ):
+        output_type = "np"
+        
+        
         if torch_device is None:
             torch_device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -82,61 +89,78 @@ class StableDiffusionPipeline(DiffusionPipeline):
             text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
 
         # get the intial random noise
-        latents = torch.randn(
-            (batch_size, self.unet.in_channels, height // 8, width // 8),
-            generator=generator,
-            device=torch_device,
-        )
+        seeds = np.zeros((n_iter,batch_size))
+        all_images = []
+        all_PIL = []
+        for ITER in range(n_iter):
+            print("Dreaming iteration",ITER)
+            latents = []
+            for i in range(batch_size):
+                seed = (seed_x+ITER) * (seed_y+i)
+                seeds[ITER,i] = seed
+                torch.manual_seed(seed)         
+                latents.append(torch.randn(
+                    (self.unet.in_channels, height // 8, width // 8),
+                    device=torch_device,
+                ))
+            latents = torch.stack(latents)
+            # set timesteps
+            accepts_offset = "offset" in set(inspect.signature(self.scheduler.set_timesteps).parameters.keys())
+            extra_set_kwargs = {}
+            if accepts_offset:
+                extra_set_kwargs["offset"] = 1
 
-        # set timesteps
-        accepts_offset = "offset" in set(inspect.signature(self.scheduler.set_timesteps).parameters.keys())
-        extra_set_kwargs = {}
-        if accepts_offset:
-            extra_set_kwargs["offset"] = 1
+            self.scheduler.set_timesteps(num_inference_steps, **extra_set_kwargs)
 
-        self.scheduler.set_timesteps(num_inference_steps, **extra_set_kwargs)
-
-        # if we use LMSDiscreteScheduler, let's make sure latents are mulitplied by sigmas
-        if isinstance(self.scheduler, LMSDiscreteScheduler):
-            latents = latents * self.scheduler.sigmas[0]
-
-        # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
-        # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
-        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
-        # and should be between [0, 1]
-        accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
-        extra_step_kwargs = {}
-        if accepts_eta:
-            extra_step_kwargs["eta"] = eta
-
-        for i, t in tqdm(enumerate(self.scheduler.timesteps)):
-            # expand the latents if we are doing classifier free guidance
-            latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            # if we use LMSDiscreteScheduler, let's make sure latents are mulitplied by sigmas
             if isinstance(self.scheduler, LMSDiscreteScheduler):
-                sigma = self.scheduler.sigmas[i]
-                latent_model_input = latent_model_input / ((sigma**2 + 1) ** 0.5)
+                latents = latents * self.scheduler.sigmas[0]
 
-            # predict the noise residual
-            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings)["sample"]
+            # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
+            # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
+            # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
+            # and should be between [0, 1]
+            accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
+            extra_step_kwargs = {}
+            if accepts_eta:
+                extra_step_kwargs["eta"] = eta
 
-            # perform guidance
-            if do_classifier_free_guidance:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            for i, t in (enumerate(self.scheduler.timesteps)):
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                if isinstance(self.scheduler, LMSDiscreteScheduler):
+                    sigma = self.scheduler.sigmas[i]
+                    latent_model_input = latent_model_input / ((sigma**2 + 1) ** 0.5)
 
-            # compute the previous noisy sample x_t -> x_t-1
-            if isinstance(self.scheduler, LMSDiscreteScheduler):
-                latents = self.scheduler.step(noise_pred, i, latents, **extra_step_kwargs)["prev_sample"]
-            else:
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs)["prev_sample"]
+                # predict the noise residual
+                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings)["sample"]
 
-        # scale and decode the image latents with vae
-        latents = 1 / 0.18215 * latents
-        image = self.vae.decode(latents)
+                # perform guidance
+                if do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-        image = (image / 2 + 0.5).clamp(0, 1)
-        image = image.cpu().permute(0, 2, 3, 1).numpy()
-        if output_type == "pil":
-            image = self.numpy_to_pil(image)
+                # compute the previous noisy sample x_t -> x_t-1
+                if isinstance(self.scheduler, LMSDiscreteScheduler):
+                    latents = self.scheduler.step(noise_pred, i, latents, **extra_step_kwargs)["prev_sample"]
+                else:
+                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs)["prev_sample"]
 
-        return {"sample": image}
+            # scale and decode the image latents with vae
+            latents = 1 / 0.18215 * latents
+            image = self.vae.decode(latents)
+
+            image = (image / 2 + 0.5).clamp(0, 1)
+            image = image.cpu().permute(0, 2, 3, 1).numpy()
+            all_images.append(torch.from_numpy(image))
+            all_PIL.append(Image.fromarray((image[0]*255).astype('uint8')))
+        
+        grid = torch.stack(all_images, 0)
+        grid = rearrange(grid, 'n b h w c -> (n b) h w c')
+        grid = rearrange(grid, 'n h w c -> n c h w')
+        grid = make_grid(grid, nrow=n_iter)
+
+        # to image
+        grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
+        grid = Image.fromarray(grid.astype(np.uint8))        
+        return grid, all_PIL, seeds
