@@ -157,7 +157,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
             image = (image / 2 + 0.5).clamp(0, 1)
             image = image.cpu().permute(0, 2, 3, 1).numpy()
             all_images.append(torch.from_numpy(image))
-            all_PIL.extend([Image.fromarray((image[i]*255).astype('uint8')) for i in range(batch_size)])
+            all_PIL.append([Image.fromarray((image[i]*255).astype('uint8')) for i in range(batch_size)])
         
         grid = torch.stack(all_images, 0)
         grid = rearrange(grid, 'n b h w c -> (n b) h w c')
