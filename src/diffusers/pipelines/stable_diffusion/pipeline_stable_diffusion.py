@@ -1,4 +1,5 @@
 import inspect
+import warnings
 from typing import List, Optional, Union
 
 import torch
@@ -7,11 +8,12 @@ from PIL import Image
 from torchvision.utils import make_grid
 from einops import rearrange
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 
 from ...models import AutoencoderKL, UNet2DConditionModel
 from ...pipeline_utils import DiffusionPipeline
 from ...schedulers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler
+from .safety_checker import StableDiffusionSafetyChecker
 
 
 class StableDiffusionPipeline(DiffusionPipeline):
@@ -22,10 +24,20 @@ class StableDiffusionPipeline(DiffusionPipeline):
         tokenizer: CLIPTokenizer,
         unet: UNet2DConditionModel,
         scheduler: Union[DDIMScheduler, PNDMScheduler, LMSDiscreteScheduler],
+        safety_checker: StableDiffusionSafetyChecker,
+        feature_extractor: CLIPFeatureExtractor,
     ):
         super().__init__()
         scheduler = scheduler.set_format("pt")
-        self.register_modules(vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet, scheduler=scheduler)
+        self.register_modules(
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            unet=unet,
+            scheduler=scheduler,
+            safety_checker=safety_checker,
+            feature_extractor=feature_extractor,
+        )
 
     @torch.no_grad()
     def __call__(
@@ -47,6 +59,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         if torch_device is None:
             torch_device = "cuda" if torch.cuda.is_available() else "cpu"
 
+
         if isinstance(prompt, str):
             batch_size = 1
         elif isinstance(prompt, list):
@@ -57,10 +70,6 @@ class StableDiffusionPipeline(DiffusionPipeline):
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
-        self.unet.to(torch_device)
-        self.vae.to(torch_device)
-        self.text_encoder.to(torch_device)
-
         # get prompt text embeddings
         text_input = self.tokenizer(
             prompt,
@@ -69,7 +78,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
             truncation=True,
             return_tensors="pt",
         )
-        text_embeddings = self.text_encoder(text_input.input_ids.to(torch_device))[0]
+        text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
 
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
@@ -81,7 +90,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
             uncond_input = self.tokenizer(
                 [""] * batch_size, padding="max_length", max_length=max_length, return_tensors="pt"
             )
-            uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(torch_device))[0]
+            uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
 
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
