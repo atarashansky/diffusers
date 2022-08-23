@@ -49,7 +49,9 @@ class StableDiffusionPipeline(DiffusionPipeline):
         strength = 0.8
     ):      
         output_type = "np"
-
+        if init_image is not None and not isinstance(self.scheduler, PNDMScheduler):
+            raise ValueError("image-to-image only works with PNDMScheduler for now")
+            
         if isinstance(prompt, str):
             batch_size = 1
         elif isinstance(prompt, list):
