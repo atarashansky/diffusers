@@ -105,12 +105,13 @@ class StableDiffusionPipeline(DiffusionPipeline):
         seeds = np.zeros((n_iter,batch_size))
         all_images = []
         all_PIL = []
-        
+        counter = 0
         for ITER in range(n_iter):
             print("Dreaming iteration",ITER)
             latents = []
             for i in range(batch_size):
-                seeds[ITER,i] = seed + i*ITER + i
+                seeds[ITER,i] = seed + counter
+                counter+=1
                 torch.manual_seed(seeds[ITER,i])  
                 noise = torch.randn((self.unet.in_channels, height // 8, width // 8), device=self.device)
                 if init_image is not None:
